@@ -21,7 +21,6 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,7 +37,7 @@ class SubscriberMethodFinder {
     private static final int SYNTHETIC = 0x1000;
 
     private static final int MODIFIERS_IGNORE = Modifier.ABSTRACT | Modifier.STATIC | BRIDGE | SYNTHETIC;
-    private static final Map<String, List<SubscriberMethod>> methodCache = new HashMap<String, List<SubscriberMethod>>();
+    private static final Map<Class<?>, List<SubscriberMethod>> methodCache = new HashMap<Class<?>, List<SubscriberMethod>>();
 
     private final Map<Class<?>, Class<?>> skipMethodVerificationForClasses;
 
@@ -52,17 +51,16 @@ class SubscriberMethodFinder {
     }
 
     List<SubscriberMethod> findSubscriberMethods(Class<?> subscriberClass) {
-        String key = subscriberClass.getName();
         List<SubscriberMethod> subscriberMethods;
         synchronized (methodCache) {
-            subscriberMethods = methodCache.get(key);
+            subscriberMethods = methodCache.get(subscriberClass);
         }
         if (subscriberMethods != null) {
             return subscriberMethods;
         }
         subscriberMethods = new ArrayList<SubscriberMethod>();
         Class<?> clazz = subscriberClass;
-        HashSet<String> eventTypesFound = new HashSet<String>();
+        HashMap<String, Class> eventTypesFound = new HashMap<String, Class>();
         StringBuilder methodKeyBuilder = new StringBuilder();
         while (clazz != null) {
             String name = clazz.getName();
@@ -72,46 +70,17 @@ class SubscriberMethodFinder {
             }
 
             // Starting with EventBus 2.2 we enforced methods to be public (might change with annotations again)
-            Method[] methods = clazz.getDeclaredMethods();
-            for (Method method : methods) {
-                String methodName = method.getName();
-                if (methodName.startsWith(ON_EVENT_METHOD_NAME)) {
-                    int modifiers = method.getModifiers();
-                    if ((modifiers & Modifier.PUBLIC) != 0 && (modifiers & MODIFIERS_IGNORE) == 0) {
-                        Class<?>[] parameterTypes = method.getParameterTypes();
-                        if (parameterTypes.length == 1) {
-                            String modifierString = methodName.substring(ON_EVENT_METHOD_NAME.length());
-                            ThreadMode threadMode;
-                            if (modifierString.length() == 0) {
-                                threadMode = ThreadMode.PostThread;
-                            } else if (modifierString.equals("MainThread")) {
-                                threadMode = ThreadMode.MainThread;
-                            } else if (modifierString.equals("BackgroundThread")) {
-                                threadMode = ThreadMode.BackgroundThread;
-                            } else if (modifierString.equals("Async")) {
-                                threadMode = ThreadMode.Async;
-                            } else {
-                                if (skipMethodVerificationForClasses.containsKey(clazz)) {
-                                    continue;
-                                } else {
-                                    throw new EventBusException("Illegal onEvent method, check for typos: " + method);
-                                }
-                            }
-                            Class<?> eventType = parameterTypes[0];
-                            methodKeyBuilder.setLength(0);
-                            methodKeyBuilder.append(methodName);
-                            methodKeyBuilder.append('>').append(eventType.getName());
-                            String methodKey = methodKeyBuilder.toString();
-                            if (eventTypesFound.add(methodKey)) {
-                                // Only add if not already found in a sub class
-                                subscriberMethods.add(new SubscriberMethod(method, threadMode, eventType));
-                            }
-                        }
-                    } else if (!skipMethodVerificationForClasses.containsKey(clazz)) {
-                        Log.d(EventBus.TAG, "Skipping method (not public, static or abstract): " + clazz + "."
-                                + methodName);
-                    }
-                }
+            try {
+                // This is faster than getMethods, especially when subscribers a fat classes like Activities
+                Method[] methods = clazz.getDeclaredMethods();
+                filterSubscriberMethods(subscriberMethods, eventTypesFound, methodKeyBuilder, methods);
+            } catch (Throwable th) {
+                // Workaround for java.lang.NoClassDefFoundError, see https://github.com/greenrobot/EventBus/issues/149
+                Method[] methods = subscriberClass.getMethods();
+                subscriberMethods.clear();
+                eventTypesFound.clear();
+                filterSubscriberMethods(subscriberMethods, eventTypesFound, methodKeyBuilder, methods);
+                break;
             }
             clazz = clazz.getSuperclass();
         }
@@ -120,10 +89,68 @@ class SubscriberMethodFinder {
                     + ON_EVENT_METHOD_NAME);
         } else {
             synchronized (methodCache) {
-                methodCache.put(key, subscriberMethods);
+                methodCache.put(subscriberClass, subscriberMethods);
             }
             return subscriberMethods;
         }
+    }
+
+    private void filterSubscriberMethods(List<SubscriberMethod> subscriberMethods,
+                                         HashMap<String, Class> eventTypesFound, StringBuilder methodKeyBuilder,
+                                         Method[] methods) {
+        for (Method method : methods) {
+            String methodName = method.getName();
+            if (methodName.startsWith(ON_EVENT_METHOD_NAME)) {
+                int modifiers = method.getModifiers();
+                Class<?> methodClass = method.getDeclaringClass();
+                if ((modifiers & Modifier.PUBLIC) != 0 && (modifiers & MODIFIERS_IGNORE) == 0) {
+                    Class<?>[] parameterTypes = method.getParameterTypes();
+                    if (parameterTypes.length == 1) {
+                        ThreadMode threadMode = getThreadMode(methodClass, method, methodName);
+                        if (threadMode == null) {
+                            continue;
+                        }
+                        Class<?> eventType = parameterTypes[0];
+                        methodKeyBuilder.setLength(0);
+                        methodKeyBuilder.append(methodName);
+                        methodKeyBuilder.append('>').append(eventType.getName());
+                        String methodKey = methodKeyBuilder.toString();
+                        Class methodClassOld = eventTypesFound.put(methodKey, methodClass);
+                        if (methodClassOld == null || methodClassOld.isAssignableFrom(methodClass)) {
+                            // Only add if not already found in a sub class
+                            subscriberMethods.add(new SubscriberMethod(method, threadMode, eventType));
+                        } else {
+                            // Revert the put, old class is further down the class hierarchy
+                            eventTypesFound.put(methodKey, methodClassOld);
+                        }
+                    }
+                } else if (!skipMethodVerificationForClasses.containsKey(methodClass)) {
+                    Log.d(EventBus.TAG, "Skipping method (not public, static or abstract): " + methodClass + "."
+                            + methodName);
+                }
+            }
+        }
+    }
+
+    private ThreadMode getThreadMode(Class<?> clazz, Method method, String methodName) {
+        String modifierString = methodName.substring(ON_EVENT_METHOD_NAME.length());
+        ThreadMode threadMode;
+        if (modifierString.length() == 0) {
+            threadMode = ThreadMode.PostThread;
+        } else if (modifierString.equals("MainThread")) {
+            threadMode = ThreadMode.MainThread;
+        } else if (modifierString.equals("BackgroundThread")) {
+            threadMode = ThreadMode.BackgroundThread;
+        } else if (modifierString.equals("Async")) {
+            threadMode = ThreadMode.Async;
+        } else {
+            if (!skipMethodVerificationForClasses.containsKey(clazz)) {
+                throw new EventBusException("Illegal onEvent method, check for typos: " + method);
+            } else {
+                threadMode = null;
+            }
+        }
+        return threadMode;
     }
 
     static void clearCaches() {

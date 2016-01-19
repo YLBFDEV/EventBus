@@ -130,7 +130,7 @@ For example, it's possible to configure the default EventBus instance to rethrow
 EventBus.builder().throwSubscriberException(BuildConfig.DEBUG).installDefaultEventBus();
 ```
 
-Note: this can be done only once before the the default EventBus instance is used the first time. This ensures consistent behavior in your app. Your Application class is a good place to configure the default EventBus instance before its used.
+Note: this can be done only once before the default EventBus instance is used the first time. This ensures consistent behavior in your app. Your Application class is a good place to configure the default EventBus instance before its used.
 
 Cancelling event delivery
 -------------------------
@@ -189,7 +189,7 @@ ProGuard obfuscates method names. However, the onEvent methods must not renamed 
 
 ```
 -keepclassmembers class ** {
-    public void onEvent*(**);
+    public void onEvent*(***);
 }
 
 # Only required if you use AsyncExecutor
